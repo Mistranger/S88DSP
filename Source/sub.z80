@@ -1,0 +1,551 @@
+    Relaxed     on
+    include     "const.inc"
+    org         s_SubProgram
+    
+    
+; ROM functions
+; Command waiting loop (meaning the end of your own program)
+Sub_CmdLoop                     equ 0x00C1
+; Send 2 bytes from (HL) and (HL + 1) to main
+Sub_SendWord                    equ 0x004B
+; Mx model identification byte
+Sub_RomType                     equ 0x07EE
+Sub_LoadData                    equ 0x0D76
+Sub_SetNoError                  equ 0x0455
+
+Sub_recvByte                    macro            
+    rst 0x10
+    endm
+
+Sub_sendByte                    macro            
+    rst 0x18
+    endm
+
+Sub_write765DataReg             macro
+    rst 0x20
+    endm
+
+Execute_Main:
+    ; Push the return destination when executing RET
+    ld          hl, Sub_CmdLoop
+    push        hl
+    ; Get the cmd type from main
+    Sub_recvByte
+    ld          (vCmdRecv),a
+    ld          hl,FunctionTable
+    ld          b,0
+    add         a,a
+    ld          c,a
+    add         hl,bc
+    ld          a,(hl)
+    inc         hl
+    ld          h,(hl)
+    ld          l,a
+    jp          (hl)
+    
+    ret
+    
+FunctionTable:
+    dw Func_NoFunc 
+    dw Func01_Init                   
+    dw Func02_GetFileTable                   
+    dw Func03_LoadS88Header                   
+    dw Func_NoFunc                   
+    dw Func05_RequestNextBlock                   
+    
+; Variables
+vCmdRecv:                        db 0
+vSendBufAddr:                    dw 0
+vPrevBufAddr:                    dw 0
+vCurrentDrive:                   db 0
+vSelectedSong:                   db 0
+vReqLoop:                        db 0
+vCurrentFileAddr:                dw 0
+vTotalBlockCount:                dw 0
+vBlocksRemain:                   dw 0
+                
+; Block acquisition
+vBlockSize:                      dw 0
+vBlockFlags:                     db 0
+vBlockReserved:                  db 0
+; Data read control
+vCurTrack                        db 0
+vCurSector                       db 0
+    
+; HL - memory ptr
+; BC - count
+; A - value
+MemSet:
+    ld          (hl),a
+    ld          d,h
+    ld          e,l
+    inc         de
+    dec         bc
+    ldir
+    ret
+
+; Calls ROM function 0x0e (load data)
+; c - drive
+; d - track
+; e - sector
+; b - sector count
+; hl - buffer
+Disk_LoadData:
+    ld          a,1
+    cp          c
+    jp          c,0x0cc0
+    call        0x0eca
+    ld          a,0xff
+    ld          (0x7f18),a
+    call        Sub_LoadData
+    call        Sub_SetNoError
+    ret
+    
+InitPlayVars:
+    xor         a
+	ld          (vReqLoop),a
+    ld          h,a
+    ld          l,a
+    ld          (vSendBufAddr),hl
+    ld          (vPrevBufAddr),hl
+    ld          hl,s_S88Header+S88H_BlockCount
+    ld          de,vTotalBlockCount
+    ldi   
+    ldi
+    ld          hl,(vTotalBlockCount)
+    ld          (vBlocksRemain),hl
+    ld          hl,s_ReadBuf
+    ld          bc,s_ReadBufMax - s_ReadBuf
+    call        MemSet
+    ret
+    
+Func_NoFunc:
+    ret
+    
+; initialize subsystem
+Func01_Init:
+    ret
+    
+Func02_GetFileTable:
+    Sub_recvByte                 ; drive number
+    ld          c,a    
+    ld          (vCurrentDrive),a
+    ld          de,0x0102        ; track/sector
+    ld          hl,s_FileInfo    ; buffer
+    ld          b,2              ; sector count
+    call        Disk_LoadData 
+    ld          hl,s_FileInfo
+    ld          bc,0x200
+    call        Sub_SendFast
+    ret
+    
+Func03_LoadS88Header:
+    Sub_recvByte                 ; song number
+    ld          (vSelectedSong),a
+    ld          b,a
+    ld          a,(vCurrentDrive)
+    ld          c,a
+    ld          hl,s_FileInfo
+    ld          de,0x20
+.getSelectedAddr:
+    add         hl,de
+    djnz        .getSelectedAddr
+    ld          (vCurrentFileAddr),hl
+    ld          a,(hl)
+    ld          d,a
+    inc         hl
+    ld          a,(hl)
+    ld          e,a
+    ; DE now contains file track+sector 
+    ld          hl,s_S88Header   ; buffer
+    ld          b,1              ; sector count
+    ; Load the header now 
+    call        Disk_LoadData
+    ; Send it to host
+    ld          hl,s_S88Header
+    ld          bc,0x100
+    call        Sub_SendFast
+    ; Prepare for playback
+    call        InitPlayVars
+    call        ReloadNewData
+    ret
+
+; Sends next block to host
+Func05_RequestNextBlock:
+    Sub_recvByte                 ; param - is loop block
+    ld          (vReqLoop),a
+	; Check if we have remaining blocks
+	ld          hl,(vBlocksRemain)
+    ld          a,h
+    or          l
+    jr          z,.noBlocksLeft
+	dec         hl
+	ld          (vBlocksRemain),hl   
+.loadHeader:
+    ; Load block header
+    ld          hl,(vSendBufAddr)
+    ld          (vPrevBufAddr),hl
+    ld          de,vBlockSize
+    ld          b,4
+.readHeader:
+    ld          a,h
+    and         0x5F
+    ld          h,a
+    ldi
+    djnz        .readHeader
+    ld          a,(vBlockSize)
+    Sub_sendByte
+    ld          a,(vBlockSize+1)
+    Sub_sendByte
+    ld          a,(vBlockFlags)
+    Sub_sendByte
+    ; Send the block now
+    ld          a,(vBlockSize)
+    ld          bc,(vBlockSize)
+    and         0x03
+    jr          z,.even4
+    inc         bc
+    inc         bc
+    inc         bc
+.even4:
+    srl         b
+    rr          c
+    srl         b
+    rr          c
+    call        Sub_SendFastBuffer
+    ; Set read pointer to next data
+    ld          hl,(vPrevBufAddr)
+    ld          bc,(vBlockSize)
+    inc         bc
+    inc         bc
+    inc         bc
+    inc         bc
+    add         hl,bc
+    ld          a,h
+    and         0x5F
+    ld          h,a
+    ld          (vSendBufAddr),hl
+    call        ReloadNewData
+    ret
+.noBlocksLeft:
+    ; Send 2 zeros instead of block size as a end of file mark
+    xor         a
+    Sub_sendByte
+    xor         a
+    Sub_sendByte
+    ret
+	
+; b - sector count
+; d - track
+; e - sector
+
+IncrementSector:
+	push        af
+	ld          a,e
+	add         a,b
+.loop:
+    cp          cTracksPerSector+1
+	jp          c,.endloop
+	inc         d
+	sub         cTracksPerSector
+	jr          .loop
+.endloop:
+    ld          e,a
+	pop         af
+	ret
+	
+
+; Fills the disk buffer with new data
+ReloadNewData:
+    ld          hl,(vSendBufAddr)
+    ld          a,h
+    or          l
+    jr          z,.initReload
+    ccf
+    ld          hl,(vSendBufAddr)
+    ld          bc,(vPrevBufAddr)
+    sbc         hl,bc
+    add         hl,bc
+    ld          hl,(vSendBufAddr)
+    ld          bc,(vPrevBufAddr)
+    push        af
+    ld          a,h
+	and         0x5C
+    ld          h,a
+    ld          a,b
+	and         0x5C
+    ld          b,a
+    pop         af
+    jr          c,.overflow
+    ld          a,h
+	jr          .load2
+.overflow:
+	ld          a,0x60
+	sub         b
+	srl         a
+	srl         a
+    push        bc
+    push        hl
+    ld          h,b
+    ld          l,0
+	ld          b,a
+    ld          a,(vCurrentDrive)
+    ld          c,a
+    call        LoadAndIncrement
+    pop         hl
+    pop         bc
+	ld          b,0x40
+    ld          a,h
+.load2:
+	sub         b
+	srl         a
+	srl         a
+    jr          z,.ret        
+    ld          h,b
+    ld          l,0
+	ld          b,a
+    ld          a,(vCurrentDrive)
+    ld          c,a
+	call        LoadAndIncrement
+.ret:
+	ret
+    ; If we are about to start playing a track, re-init everything
+.initReload:
+    ld          hl,s_ReadBuf     ; buffer
+    ld          (vSendBufAddr),hl
+    ld          (vPrevBufAddr),hl
+    ld          ix,(vCurrentFileAddr)
+    ld          a,(ix+FAT_STrack)
+    ld          d,a
+    ld          a,(ix+FAT_SSector)
+    ld          e,a
+    ld          b,1
+    call        IncrementSector
+	ld          (vCurTrack),de
+    ld          b,cTracksPerSector              ; sector count
+    ld          a,(vCurrentDrive)
+    ld          c,a
+    call        LoadAndIncrement
+    ret
+	
+; hl - buffer
+; b -sector count
+LoadAndIncrement:
+    ld          de,(vCurTrack)
+	push        af
+	push        bc
+    ld          a,e
+    dec         a
+    add         a,b
+    cp          cTracksPerSector+1
+    jr          c,.load1
+    push        hl
+    push        bc
+    ld          a,cTracksPerSector+1
+    sub         e
+    ld          b,a
+    call        Disk_LoadData
+    ld          a,b
+.incbuf:
+    inc         h
+    inc         h
+    inc         h
+    inc         h
+    djnz        .incbuf
+    pop         bc
+    inc         d
+    sub         b
+    neg         a
+    ld          b,a
+    ld          e,1
+    call        Disk_LoadData
+    pop         hl
+    jr          .ret
+.load1:
+	call        Disk_LoadData
+.ret:
+	pop         bc
+	pop         af
+	ld          de,(vCurTrack)
+	call        IncrementSector
+	ld          (vCurTrack),de
+	ret
+;
+;LoadLoopBlock:
+;    ld          ix,(vCurrentFileAddr)
+;    ld          a,(ix+FAT_LTrack)
+;    ld          d,a
+;    ld          a,(ix+FAT_LSectorOffset)
+;    ld          e,a
+;    ld          hl,s_ReadBuf     ; buffer
+;    ld          (vSendBufAddr),hl
+;    ld          b,8              ; sector count
+;    call        Disk_LoadData
+;    ret
+    
+; Data transmission/reception
+    
+;;
+;data transmission to main (4 byte transfer)
+;;
+;param .: hl buffer
+;param .: bc repeat count (bc * 4 bytes sent)
+;;
+Sub_SendFast:
+;set 8255 to 4-byte transmission mode (pa = transmit, pb = transmit)
+    ld          a,81h
+    out         (0ffh),a
+;send data 1
+.send1:
+    ld          a,(hl)
+    inc         hl
+    out         (0fch),a
+;send data 2
+    ld          a,(hl)
+    inc         hl
+    out         (0fdh),a
+;send dav = 1
+    ld          a,09h
+    out         (0ffh),a
+;wait until dav = 1
+.send2:
+    in          a,(0feh)
+    rrca
+    jr          nc,.send2
+;send data 3
+    ld          a,(hl)
+    inc         hl
+    out         (0fch),a
+;send data 4
+    ld          a,(hl)
+    inc         hl
+    out         (0fdh),a
+;send dav = 0
+    ld          a,08h
+    out         (0ffh),a
+;wait until dav = 0
+.send3:
+    in          a,(0feh)
+    rrca
+    jr          c,.send3
+; loop
+    dec         bc
+    ld          a,c
+    or          b
+    jr          nz,.send1
+;set 8255 to normal mode (pa = receive, pb = send)
+    ld          a,91h
+    out         (0ffh),a
+    ret
+    
+; Same, but keeps HL within 0x4000...0x5fff
+Sub_SendFastBuffer:
+;set 8255 to 4-byte transmission mode (pa = transmit, pb = transmit)
+    ld          a,81h
+    out         (0ffh),a
+;send data 1
+.send1:
+    ld          a,(hl)
+    inc         hl
+    out         (0fch),a
+    ld          a,h
+    and         0x5F
+    ld          h,a
+;send data 2
+    ld          a,(hl)
+    inc         hl
+    out         (0fdh),a
+    ld          a,h
+    and         0x5F
+    ld          h,a
+;send dav = 1
+    ld          a,09h
+    out         (0ffh),a
+;wait until dav = 1
+.send2:
+    in          a,(0feh)
+    rrca
+    jr          nc,.send2
+;send data 3
+    ld          a,(hl)
+    inc         hl
+    out         (0fch),a
+    ld          a,h
+    and         0x5F
+    ld          h,a
+;send data 4
+    ld          a,(hl)
+    inc         hl
+    out         (0fdh),a
+    ld          a,h
+    and         0x5F
+    ld          h,a
+;send dav = 0
+    ld          a,08h
+    out         (0ffh),a
+;wait until dav = 0
+.send3:
+    in          a,(0feh)
+    rrca
+    jr          c,.send3
+; loop
+    dec         bc
+    ld          a,c
+    or          b
+    jr          nz,.send1
+;set 8255 to normal mode (pa = receive, pb = send)
+    ld          a,91h
+    out         (0ffh),a
+    ret
+
+;;
+;data reception from main (4 byte transfer)
+;;
+;param .: hl buffer
+;param .: bc repeat count (bc * 4 bytes received)
+;;
+Sub_RecvFast:
+;set 8255 to 4-byte transmission mode (pa = receive, pb = receive)
+    ld          a,93h
+    out         (0ffh),a
+;wait until dav = 1
+.recv1:
+    in          a,(0feh)
+    rrca
+    jr          nc,.recv1
+;receive data 1
+    in          a,(0fdh)
+    ld          (hl),a
+    inc         hl
+;receive data 2
+    in          a,(0fch)
+    ld          (hl),a
+    inc         hl
+;send dav = 1
+    ld          a,09h
+    out         (0ffh),a
+;wait until dav = 0
+.recv2:
+    in          a,(0feh)
+    rrca
+    jr          c,.recv2
+.recv3:
+    in          a,(0fdh)
+    ld          (hl),a
+    inc         hl
+;receive data 4
+    in          a,(0fch)
+    ld          (hl),a
+    inc         hl
+;send dav = 0
+    ld          a,08h
+    out         (0ffh),a
+; loop
+    dec         bc
+    ld          a,c
+    or          b
+    jr          nz,.recv1
+;set 8255 to normal mode (pa = receive, pb = send)
+    ld          a,91h
+    out         (0ffh),a
+    ret

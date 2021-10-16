@@ -1,0 +1,159 @@
+;
+;	IPL
+;
+; Placed on track 0, sector 1
+	Relaxed	on
+    include     "const.inc"
+    
+	ORG		    cMem_IPL
+
+Main:
+	di
+	ld			a,$80
+	out			(P_70_TextWindowOffset),a					;window offset address
+	
+	
+	Sub_SendCommand	Sub1F_SetDiscMode
+	ld			a,0
+	call		Disk88_sendbyte
+    ld			a,0x23
+	call		Disk88_sendbyte
+	Sub_SendCommand	Sub21_SetBoundaryMode
+	ld			a,2
+	call		Disk88_sendbyte
+    Sub_SendCommand	Sub17_SetSurfaceMode
+	ld			a,$F
+	call		Disk88_sendbyte
+
+	ld			hl,cMem_Program				;hl = load address 
+	ld			bc,(12 << 8) | 0		;b = number of sectors c = drive number $ 8000- $ BFFF 
+	ld			de,(2 << 8) | 1			;d = track number e = sector number 
+	call		Disk88_Load
+	
+	
+	
+	;ld			($FFFE), hl 	
+	;ldi
+	;ldir
+	jp			cMem_Program
+
+;--------------------------------------------------------------------------------------------------
+; Disk load routine for PC-8801 series (2D)
+; Since it is assumed to be incorporated in IPL, only the minimum necessary
+;
+; HL = load start address
+; B = number of sectors
+; C = drive number
+; D = track number
+; E = sector number
+
+Disk88_Load:
+	Sub_SendCommand	Sub02_ReadData
+	ld			a,8
+.skip:
+	call		Disk88_sendbyte
+	ld			a,c						; Drive number (0/1)
+	call		Disk88_sendbyte
+	ld			a,d						; Track number (0-81)
+	call		Disk88_sendbyte
+	ld			a,e						; Sector number (1-16)
+	call		Disk88_sendbyte
+
+	Sub_SendCommand	Sub12_FastSendData
+.loop:
+	call		Disk88_readdata
+	call		Disk88_readdata
+	call		Disk88_readdata
+	call		Disk88_readdata
+
+	inc			e
+	ld			a,e
+	cp			9
+	jr			z,.nextTrack
+	djnz		.loop
+	ret
+.nextTrack:
+	inc			d						; To the next track
+	ld			e,1						; Sector is from 1
+	djnz		Disk88_Load
+	ret
+
+;--------------------------------------------------------------------------------------------------
+; Main-> SubSys     Send command to subsystem
+Disk88_sendcmd:
+	push		af
+	ld			a,%1111					; 1. Sender sets ATN = 1
+	out			(P_FF_DiskSysControl),a
+.wait:									; 2. Receiver detects ATN == 1 and sets RFD = 1
+	in			a,(P_FE_DiskSysPortC)   
+	and			2						; Wait for SubSys RFD = 1
+	jr			z,.wait
+	
+	ld			a,%1110					; 3. Transmitter detects RFD == 1 and sets ATN = 0
+	out			(P_FF_DiskSysControl),a
+	jr			Disk88_Sendbytesub
+
+Disk88_sendbyte:
+	push		af
+.wait:									; 1.Receiver sets RFD = 1
+	in			a,(P_FE_DiskSysPortC)
+	and			2						; Wait for SubSys RFD = 1
+	jr			z,.wait
+
+Disk88_sendbytesub:
+	pop			af
+	out			(P_FD_DiskSysPortB),a	; 4. The sender puts the data on the bus
+
+	ld			a,%1001					; 5. Sender sets DAV = 1
+	out			(P_FF_DiskSysControl),a
+.wait1: 								; 6. Receiver detects DAV == 1 and sets RFD = 0
+										; 7. Receiver receives data
+										; 8. DAC = 1 on the receiving side
+	in			a,(P_FE_DiskSysPortC)
+	and			4						; Wait for SubSys DAC = 1
+	jr			z,.wait1
+
+	ld			a,%1000					; 9. Transmitter detects DAC == 1 and sets DAV = 0
+	out			(P_FF_DiskSysControl),a
+.wait2:
+	in			a,(P_FE_DiskSysPortC)   ; 10. Receiver detects DAV == 0 and sets DAC = 0
+	and			4						; Wait for SubSys DAC = 0
+	jr			nz,.wait2
+	ret
+;--------------------------------------------------------------------------------------------------
+;Receive 256 bytes
+Disk88_readdata:
+	push		bc
+	push		de
+	
+	ld			bc,(0 << 8) | P_FD_DiskSysPortA
+	ld			de,(%1010 << 8) | %1100
+	
+.loop:
+	ld			a,%1011					; 1. Receiver sets RFD = 1
+	out			(P_FF_DiskSysControl),a
+	
+.wait1:									; 2. Transmitter detects RFD == 1 and puts data (n) on the bus
+	in			a,(P_FE_DiskSysPortC)	; 3. Sender sets DAV = 1
+	rrca								; Data Valid?
+	jp			nc,.wait1
+	
+	ld			a,d						; 4. Receiver detects DAV == 1 and sets RFD = 0
+	out			(P_FF_DiskSysControl),a
+	ini									; 5. Receiver receives data
+	ld			a,%1101					; 6. DAC = 1 on the receiving side
+	out			(P_FF_DiskSysControl),a
+	
+.wait2:
+	in			a,(P_FE_DiskSysPortC)	; 7. Transmitter detects DAC == 1 and puts data (n+1) on the bus
+	rrca								; 8. Sender sets DAV = 0
+	jp			c,.wait2
+	
+	ini									; 9. Receiver detects DAV == 0 and receives data
+	ld			a,e						; Data Accepted
+	out			(P_FF_DiskSysControl),a ; 10. DAC = 0 on the receiving side
+	jp			nz,.loop
+	
+	pop			de
+	pop			bc
+	ret

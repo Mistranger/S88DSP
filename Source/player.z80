@@ -1,0 +1,888 @@
+    Relaxed    on
+
+    include         "const.inc"
+    org             cMem_Program   
+    
+; Floppy FAT format
+; 0x00 Format version (1)
+; 0x01 Actual file count
+; 0x02-0x1f Reserved
+;+0x20    
+; 0x00 db - start track
+; 0x01 db - start sector
+; 0x02 db - flags
+; 0x03 db - reserved
+; 0x04-0x1f - filename
+; Max 63 files (2048 bytes)
+
+
+; S88 Format
+; 0x00-0x02 - magic 'S88'
+; 0x03 - format version
+; 0x04 - flags
+; 0x05 - timing source
+; 0x06-0x07 - timing clock
+; 0x08-0x09 - block count 
+; 0x0a-0x0d - sample count
+; 0x0e-0x0f - loop block offset
+; 0x10-0x11 - loop block number
+; 0x11-0x1f - reserved
+; 0x20-0x3ff - tag area
+;+0x400
+; 0x00-0x01 - block size
+; 0x02 - flags
+; 0x03 - reserved
+; 0x04... - block data
+; Block flags format
+; 1-2 - compression algorighm (00 - LZSA1, 01 - LZSA2, 10 - raw, 11 - unused) 
+; 3-4 - block size (00 - 16kb, 01 - 8kb, 10 - 4kb, 11 - unused)
+; 5-8 - reserved
+
+; Tag order
+; 0 - tag end
+; 1 - title
+; 2 - artist
+; 3 - game
+; 4 - year
+; 5 - genre
+; 6 - comment
+; 7 - copyright
+; 8 - arranger
+; 9 - system
+; flags format
+; 1 - compressed/raw
+
+
+; SUB API
+; Functions:
+; 1 - Initialize SUB
+;     no in params
+; 2 - Load and recieve file table
+;     no in params
+; 3 - load S88 header
+;     1 - song number
+; 4 - play S88
+;     song header must be loaded first
+; 5 - request next block
+;     1 - is loop block (clears 
+; Priority control
+; Main
+; 1 - Timer 600
+
+; 10 - MainLoop
+; Sub
+
+; 10 - MainLoop
+
+; Memory map
+; Main
+; 0x0000-0x7FFF - play buffers (2x16kb)
+; 0x8000-0x8FFF - loop buffer (4kb)
+; 0x9000-0xBEFF - program area
+; 0xBF00-0xBFFF - interrupt vector and stack area
+; 0xD400-0xD7FF - S88 header
+; 0xD800-0xDFFF - file table
+; 0xE000-0xFFFF - unpack buffer (8kb)
+
+
+; Sub
+; 0x4000-0x5FFF - read buffer
+; 0x7400-0x7FFF - program and stack
+
+; Entry point
+EntryPoint:
+    jp          Player_Main
+   
+; ---- Global variables ----
+; System 
+vErrorCode              db 0
+vErrorParam1            db 0
+vErrorParam2            db 0
+vErrorParam3            db 0
+vErrorParam4            db 0
+; Interrupt control     
+vIn600Int:              db 0 
+vInVRTC:                db 0
+                        
+                        
+vMachineType            db 0
+vIsOPNA                 db 0
+; Playback control      
+vReqLoop                db 0    ; Sets when player requests loop block
+vIsDataPresent          db 0    ; Sets when there is a block available for unpacking
+vCurrentSong            db 0
+vInLoopBuffer           db 0
+vReqNextSong            db 0
+vKeyDelay               dw 0
+
+vPlayerState:           db 0
+vCurPlayTimer:          dd 0
+vWaitCycles:            dw 0
+vPlayAddr:              dw 0
+vBuf1Ready:             db 0
+vBuf2Ready:             db 0
+; Sub data I/O
+vBlockFlags             db 0
+vLastBlockSize          dw 0
+
+vLoopPresent            db 0
+vFillBufAddr            dw 0
+vIsBufFillActive        db 0
+
+; ----------- Includes -----------------
+    include     "unlzsa1_fast.asm"
+    include     "unlzsa2_fast.asm"
+    include     "sound.z80"
+    include     "disk_io.z80"
+
+; ----------- Utility functions --------
+
+; HL - memory 1
+; DE - memory 2
+; B - bytes to compare
+MemCmp:
+    ld          a,(de)
+    cp          (hl)
+    ret         nz
+    inc         hl
+    inc         de
+    djnz        MemCmp
+    ret         z
+
+; HL - memory ptr
+; BC - count
+; A - value
+MemSet:
+    ld          (hl),a
+    ld          d,h
+    ld          e,l
+    inc         de
+    dec         bc
+    ldir
+    ret
+    
+ErrorHalt:
+    ld          (vErrorCode),a
+    di
+    halt
+    
+; Interrupt processing
+    
+Int_Dummy:
+    ei
+    ret
+    
+Int_VRTC:
+    ei
+    ret
+    
+Int_Timer:
+    di
+.handler:
+    jp          Handler_Timer600
+    
+; ----------------- Timer 600 handling
+;Handler_Timer600_IncTimer MACRO
+;    ld          hl,(vCurPlayTimer)
+;    inc         hl
+;    ld          (vCurPlayTimer),hl
+;    ld          a,h
+;    or          l
+;    jp          nz,.next
+;    ld          hl,vCurPlayTimer+2
+;    inc         (hl)
+;    ENDM
+    
+    
+Handler_Timer600_Busy:
+    push        af
+    push        hl
+    ld          hl,(vWaitCycles)
+    dec         hl
+    ld          a,h
+    or          l
+    ld          (vWaitCycles),hl
+    jp          z,.handleInt
+.ret:
+    pop         hl
+    ld          a,3
+    out         (P_E4_IntLevel),a
+    pop         af
+    ei
+    ret
+.handleInt:
+    ld          hl,Handler_Timer600
+    ld          (Int_Timer.handler+1),hl
+    jp          Handler_Timer600.fromBusy
+
+Handler_Timer600:  
+    push        af
+    push        hl  
+.fromBusy:
+    push        bc
+    push        de
+    ei
+; Process commands that are available
+.execCmd:
+    call        Buffer_ReadByte
+    cp          0xf0
+    jp          nc,.specialCmds
+.writeSoundReg:
+    ld          d,a
+    call        Buffer_ReadByte
+.OPNAfunc:
+    call        WriteOPN ;WriteOPNA
+    jp          .execCmd
+.specialCmds:
+    sub         0xf0
+    add         a,a
+    ld          h,0
+    ld          l,a
+    ld          de,SpecialCmdsTable
+    add         hl,de
+    ld          a,(hl)
+    inc         hl
+    ld          h,(hl)
+    ld          l,a
+    jp          (hl)
+; Special commands processing
+S88Cmd_NoCMD:
+    jp          Handler_Timer600.execCmd
+; 0xf1
+S88Cmd_SetPort1:
+    ld          hl,WriteOPN
+    ld          (Handler_Timer600.OPNAfunc+1),hl
+    jp          Handler_Timer600.execCmd
+; 0xf2
+S88Cmd_SetPort2:
+    ld          hl,WriteOPNA
+    ld          (Handler_Timer600.OPNAfunc+1),hl
+    jp          Handler_Timer600.execCmd
+; 0xfc
+S88Cmd_SetEndLoop:
+    ; Advance to loop buffer
+    ld          a,(vLoopPresent)
+    or          a
+    ;jr          z,.loadnext
+    jr          .loadnext
+    ld          hl,cMem_LoopBuf
+    ld          (vPlayAddr),hl
+    ld          a,0x64 ; bit 4,h - checks for loop buffer overfow
+    ld          (Buffer_ReadByte.loopBit+1),a
+    ld          a,1
+    ld          (vInLoopBuffer),a
+    ld          (vReqNextSong),a
+    jp          Ret600
+.loadnext:
+    call        StopPlaying
+    call        NextSong
+    jp          Ret600
+; 0xfd
+S88Cmd_SetWait:
+    call        Buffer_ReadByte
+    ld          b,0
+    ld          c,a
+.addWait:
+; atomic op to avoid corruption
+    di
+    ld          hl,(vWaitCycles)
+    add         hl,bc
+    ld          (vWaitCycles),hl
+    ld          hl,Handler_Timer600_Busy
+    ld          (Int_Timer.handler+1),hl
+    ei
+    jp          Ret600
+; 0xfe
+S88Cmd_SetWaitEx:
+    call        Buffer_ReadByte
+    ld          b,a
+    ld          c,0
+    jp          S88Cmd_SetWait.addWait    
+Ret600:
+    di          
+    xor         a
+    ld          (vIn600Int),a
+    ld          a,3
+    out         (P_E4_IntLevel),a 
+    pop         de
+    pop         bc
+    pop         hl
+    pop         af
+    ei
+    ret
+   
+SpecialCmdsTable:
+    dw S88Cmd_SetPort1      ; 0xf0
+    dw S88Cmd_SetPort2      ; 0xf1
+    dw S88Cmd_NoCMD         ; 0xf2
+    dw S88Cmd_NoCMD         ; 0xf3
+    dw S88Cmd_NoCMD         ; 0xf4
+    dw S88Cmd_NoCMD         ; 0xf5
+    dw S88Cmd_NoCMD         ; 0xf6
+    dw S88Cmd_NoCMD         ; 0xf7
+    dw S88Cmd_NoCMD         ; 0xf8
+    dw S88Cmd_NoCMD         ; 0xf9
+    dw S88Cmd_NoCMD         ; 0xfa
+    dw S88Cmd_NoCMD         ; 0xfb
+    dw S88Cmd_SetEndLoop    ; 0xfc
+    dw S88Cmd_SetWait       ; 0xfd
+    dw S88Cmd_SetWaitEx     ; 0xfe
+    dw S88Cmd_NoCMD         ; 0xff
+    
+; Reads a byte from buffer, checks underrun and switches buffers if nessesary
+Buffer_ReadByte:
+    ld          hl,(vPlayAddr)
+    ld          a,(hl)
+    inc         hl
+    ld          (vPlayAddr),hl
+.loopBit:
+    bit         6,h
+    ret         z
+    ; Buffer is depleted, switch
+    push        af
+    ; Check if we are in loop
+    ld          a,(vInLoopBuffer)
+    or          a
+    jr          z,.noLoop
+    ; TO-DO force song loading
+    halt
+.noLoop:
+    bit         7,h
+    jr          z,.switchTo2
+    ld          a,0
+    ld          (vBuf2Ready),a
+    ld          (vPlayAddr+1),a
+    ld          a,0x74
+    ld          (.loopBit+1),a
+    ld          a,(vBuf1Ready)
+    or          a
+    call        z,FillBuffer1
+    jp          .ret
+; assuming that buffers are next to each other, no need to modify address
+.switchTo2:
+    ld          a,0
+    ld          (vBuf1Ready),a
+    ld          a,0x7c
+    ld          (.loopBit+1),a
+    ld          a,(vBuf2Ready)
+    or          a
+    call        z,FillBuffer2
+.ret:
+    pop         af
+    ret
+    
+LoadFileTable:
+    ld          c,2
+    call        Sub_ExecuteFunc
+    ld          a,0
+    call        Sub_SendData
+    ld          hl,cMem_FileSys
+    ld          bc,0x200
+    call        Disk_RecvFast
+    ret
+    
+LoadS88Header:
+    ld          c,3
+    call        Sub_ExecuteFunc
+    ld          a,(vCurrentSong)
+    call        Sub_SendData
+    ld          hl,cMem_S88Header
+    ld          bc,0x100
+    call        Disk_RecvFast
+    ;ld         hl,(cMem_S88Header+S88H_BlockCount)
+    ret
+    
+; de - dst
+; returns de - the addr of first byte following unpacked data
+DecodeUnpackBuffer:
+    push        af
+    push        bc
+    push        hl
+    ld          hl,cMem_UnpackBuf
+    ld          a,(vBlockFlags)
+    and         0x03
+    cp          0
+    jr          z,.unpackLZSA1
+    cp          1
+    jr          z,.unpackLZSA2
+    cp          2
+    jr          z,.unpackRaw
+    jp          .errorUnknownAlg
+.unpackLZSA1:
+    call        DecompressLZSA1
+    jr          .ret
+.unpackLZSA2:
+    call        DecompressLZSA2
+    jr          .ret
+.unpackRaw:
+    ld          bc,cUnpackBufSize
+    ldir
+.ret:
+    pop         hl
+    pop         bc
+    pop         af
+    ret
+  
+.errorUnknownAlg:
+    ld          a,E_UnknownCompression
+    jp          ErrorHalt
+
+; Gets next data for unpacking and stores it in unpack buffer 
+; A - is loop block
+RecvNextBuffer:
+    push        af
+    push        bc
+    push        de
+    push        hl
+    ld          c,5
+    call        Sub_ExecuteFunc
+    call        Sub_SendData       ; send A
+    call        Sub_RecvData
+    ld          c,a
+    call        Sub_RecvData
+    ld          b,a
+    ld          (vLastBlockSize),bc
+    ; Check if there is no next data
+    ld          a,b
+    or          c
+    jp          z,.noBlocks
+    ; divide by 4
+    ld          a,c
+    and         0x03
+    jr          z,.even4
+    inc         bc
+    inc         bc
+    inc         bc
+.even4:    
+    srl         b
+    rr          c
+    srl         b
+    rr          c
+    call        Sub_RecvData       ; flags
+    ld          (vBlockFlags),a
+    ld          hl,cMem_UnpackBuf
+    call        Disk_RecvFast
+    ld          a,1
+    jp          .ret
+.noBlocks:
+    xor         a
+.ret:
+    ld          (vIsDataPresent),a
+    pop         hl
+    pop         de
+    pop         bc
+    pop         af
+    ret
+    
+    
+; A - is loop buffer (1 - yes, 0 - no)
+; HL - buffer dst
+FillBuffer:
+    push        bc
+    push        de
+    ld          (vReqLoop),a
+    ld          a,1
+    ld          (vIsBufFillActive),a
+    ld          b,1
+    ld          (vFillBufAddr),hl
+    ld          a,(vReqLoop)
+    call        RecvNextBuffer
+    ; Check the presence of loop block
+    ld          a,(vReqLoop)
+    or          a
+    jp          z,.noLoop
+    ; Check if block is correct loop block (4 kb)
+    ld          a,(vIsDataPresent)
+    or          a
+    jp          z,.errorOutOfData
+    ld          a,(vBlockFlags)
+    and         0x0C
+    srl         a
+    srl         a
+    cp          2
+    jp          nz,.wrongLoopSize
+    jp          .copyBuffer
+.noLoop:    
+    ld          a,(vIsDataPresent)
+    or          a
+    jp          z,.outOfData
+    ld          a,(vBlockFlags)
+    and         0x0C
+    srl         a
+    srl         a
+    jr          z,.copyBuffer ; 16 kb
+    inc         b
+    dec         a
+    jr          z,.copyBuffer ; 8 kb  
+    inc         b
+    inc         b    
+    dec         a
+    jr          z,.copyBuffer ; 4 kb
+    ; unknown block size
+    ld          a,E_WrongBlockSize
+    jp          ErrorHalt
+.loadAndCopy:
+    call        RecvNextBuffer
+    ld          a,(vIsDataPresent)
+    or          a
+    jp          z,.errorOutOfData
+.copyBuffer:
+    ld          de,(vFillBufAddr)
+    call        DecodeUnpackBuffer
+    ld          (vFillBufAddr),de
+    djnz        .loadAndCopy
+.ret:
+    xor         a
+    ld          (vIsBufFillActive),a
+    pop         de
+    pop         bc
+    ret
+.outOfData:
+    jr          .ret
+    ; Error handling
+.wrongLoopSize:
+    ld          a,E_WrongBlockSize
+    jp          ErrorHalt
+.errorNoLoopData:
+    ld          a,E_NoLoopData
+    jp          ErrorHalt
+.errorOutOfData:
+    ld          a,E_OutOfData
+    jp          ErrorHalt
+    
+ClearUnpackBuf:
+    push        af
+    push        bc
+    push        de
+    push        hl
+    ld          hl,cMem_UnpackBuf
+    ld          bc,cUnpackBufSize
+    xor         a
+    call        MemSet
+    pop         hl
+    pop         de
+    pop         bc
+    pop         af
+    ret
+    
+FillBuffer1:
+    ld          a,(vIsBufFillActive)
+    or          a
+    jr          nz,FillBuffer1
+    ld          a,(vBuf1Ready)
+    or          a
+    ret         nz
+    call        ClearUnpackBuf
+    push        hl
+    ld          a,0
+    ld          hl,cMem_PlayBuf1
+    call        FillBuffer
+    ld          a,1
+    ld          (vBuf1Ready),a
+    pop         hl
+    ret
+
+FillBuffer2:
+    ld          a,(vIsBufFillActive)
+    or          a
+    jr          nz,FillBuffer2
+    ld          a,(vBuf2Ready)
+    or          a
+    ret         nz
+    call        ClearUnpackBuf
+    push        hl
+    ld          hl,cMem_PlayBuf2
+    ld          a,0
+    call        FillBuffer
+    ld          a,1
+    ld          (vBuf2Ready),a
+    pop         hl
+    ret
+
+InitPlayVars:
+    xor         a
+    ld          h,a
+    ld          l,a
+    ld          (vFillBufAddr),hl
+    ld          (vWaitCycles),hl
+    ld          (vCurPlayTimer),hl
+    ld          (vReqLoop),a
+    ld          (vBlockFlags),a
+    ld          (vIsBufFillActive),a
+    ld          (vLoopPresent),a
+    ld          (vBuf1Ready),a
+    ld          (vBuf2Ready),a    
+    ld          (vIsDataPresent),a    
+    
+    ret
+    
+InitOPNAPlay:
+    push        af
+    push        bc
+    push        de
+    push        hl
+    SendOPN		0x7,%00111000 ; SSG init
+    ; SSG volume initialization
+    ld          d,0x08
+    xor         a
+    call        InitOPNPart
+    ; FM sound source SL / RR
+    ld          d,0x80
+    ld          b,4
+    ld          a, 0xFF
+.init1:
+    call        InitOPNPart
+    inc         d
+    djnz        .init1
+    ; FM sound source key off
+    ld          d,0x28
+    ld          b,3
+    xor         a
+.init2:
+    push        bc
+    call        WriteOPN
+    pop         bc
+    inc         a
+    djnz        .init2
+    ; Panpot setting
+    ld          d,0xb4
+    ld          a,0x80
+    call        InitOPNPart
+    ld          d,0xb4
+    ld          a,0x40
+    call        InitOPNAPart
+    ; FM sound source SL / RR
+    ld          d,0x80
+    ld          b,4
+    ld          a,0xff
+    ; 4 operator loop
+.init3:
+    call        InitOPNAPart
+    inc         d
+    djnz        .init3
+    ; FM sound source key off
+    ld          d, 0x28
+    ld          b, 3
+    ld          a, 0x04
+.init4:
+    push        bc
+    call        WriteOPN
+    pop         bc
+    inc         a
+    djnz        .init4
+    pop         hl
+    pop         de
+    pop         bc
+    pop         af
+    ret
+
+
+    
+S88_Magic:
+    db          "S88"
+    
+StartPlaying:
+    push        af
+    push        hl
+    call        StopPlaying
+    ld          a,0x74
+    ld          (Buffer_ReadByte.loopBit+1),a
+    xor          a
+    ld          (vInLoopBuffer),a
+    ld          hl,0
+    ld          (vPlayAddr),hl
+    ld          hl,Handler_Timer600
+    ld          (Int_Timer.handler+1),hl
+    ld          a,3
+    out         (P_E4_IntLevel),a
+    ld          a,1
+    out         (P_E6_IntEnable),a
+    ei
+    pop         af
+    pop         hl
+    ret
+    
+; Starts selected VGM playing
+; 
+; S88 header should be loaded first
+; 0. If we are playing a track already: stop it.
+; 1. Check if we have loop area.
+; 2. If do, load the block with loop area.
+; 3. If not, fill the buffers and then load 4kb loop buffer from 1st buffer.
+; 4. Start playing by enabling timer interrupt.
+VGM_Play:
+    call        InitPlayVars  
+    ; Check magic string    
+    ld          hl,S88_Magic
+    ld          de,cMem_S88Header
+    ld          b,3
+    call        MemCmp
+    jp          nz,.notS88error
+    ; Check if song contains loop block
+    ld          hl,(cMem_S88Header + S88H_LoopOffset)
+    ld          a,h
+    or          l
+    jr          z,.noLoop    
+    ; the first block is loop block
+    ld          a,1
+    ld          (vLoopPresent),a
+    ld          hl,cMem_LoopBuf
+    call        FillBuffer
+    jr          .loadBuffers
+.noLoop:
+    xor         a
+    ld          (vLoopPresent),a
+    ; load both buffers
+.loadBuffers:
+    call        FillBuffer1
+    call        FillBuffer2
+    ; start playing
+    call        StartPlaying
+    ret
+.notS88error:
+    ld          a,E_NotS88File
+    jp          ErrorHalt
+    
+MainLoop:
+    call        CheckNextSong
+    call        CheckBuffers
+    push        af
+    push        hl
+    ld          hl,(vKeyDelay)
+    ld          a,h
+    or          l
+    jp          z,.keyCheck
+    dec         hl
+    ld          (vKeyDelay),hl
+    jp          .skip
+.keyCheck:
+    in          a,(0x09)
+    and         0x40
+    jp          nz,.skip
+    ld          hl,0x1FFF
+    ld          (vKeyDelay),hl
+    call        StopPlaying
+    call        NextSong
+    
+.skip:
+    pop         hl
+    pop         af
+    jp          MainLoop
+    
+LoadSubProgram:
+    ld          a,Sub0E_LoadData
+    call        Sub_SendCmd
+    ld          a,1           ; sector num
+    call        Sub_SendData
+    ld          a,0           ; drive
+    call        Sub_SendData
+    ld          a,1           ; track
+    call        Sub_SendData
+    ld          a,1           ; sector
+    call        Sub_SendData
+    ld          a,hibyte(s_SubProgram)
+    call        Sub_SendData
+    ld          a,lowbyte(s_SubProgram)
+    call        Sub_SendData
+    ret
+    
+
+StartupInit:
+    di
+    ld          a,hibyte(Int_Table)
+    ld          i,a ; set interrupt vector
+    ld          a,00111011b
+    out         (0x31),a
+    ld          a,11111000b
+    out         (0x32),a
+    call        LoadSubProgram
+    ret
+    
+; Check if buffers are empty and fill them
+CheckBuffers:
+    push        af
+    ld          a,(vIsDataPresent) ; don't bother if there is no data
+    or          a
+    jp          z,.ret
+    ld          a,(vBuf1Ready)
+    or          a
+    jp          nz,.buf2
+    call        FillBuffer1
+.buf2:
+    ld          a,(vBuf2Ready)
+    or          a
+    jp          nz,.ret
+    call        FillBuffer2
+.ret:
+    pop         af
+    ret
+    
+CheckNextSong:
+    push        af
+    ld          a,(vReqNextSong)
+    or          a
+    jp          z,.ret
+    xor         a
+    ld          (vReqNextSong),a
+    call        NextSong
+.ret:
+    pop         af
+    ret
+    
+    
+StopPlaying:
+    push        af
+    di
+    call        InitOPNAPlay
+    ld          a,0
+    out         (P_E6_IntEnable),a
+    pop         af
+    ret
+    
+NextSong:
+    push        af
+    push        hl
+    ld          hl,cMem_FileSys+FAT_TotalFiles
+    ld          a,(vCurrentSong)
+    cp          (hl)
+    jp          nc,.noMoreSongs
+    inc         a
+    ld          (vCurrentSong),a
+    call        LoadS88Header
+    call        VGM_Play
+    pop         hl
+    pop         af
+    ret
+.noMoreSongs:
+    di
+    halt
+
+Player_Main:
+    ld          sp,cMem_Stack
+    call        StartupInit
+    call        OPNA_Setup
+    call        LoadFileTable
+    call        NextSong
+.run:
+    
+    jp          MainLoop
+
+    halt
+
+
+    org         cMem_IntArea
+Int_Table:          
+    dw          Int_Dummy                ;RXRDY
+    dw          Int_VRTC                 ;VRTC
+    dw          Int_Timer                ;CLOCK
+    dw          Int_Dummy                ;INT4
+    dw          Int_Dummy                ;INT3
+    dw          Int_Dummy                ;INT2
+    dw          Int_Dummy                ;FDINT1
+    dw          Int_Dummy                ;FDINT2
+    ; Stack area
+    rept     240
+    db 0
+    endm
+    
+    

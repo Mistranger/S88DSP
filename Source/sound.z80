@@ -1,0 +1,84 @@
+    Relaxed        on    
+; ----  Sound ----
+
+
+
+SendOPN MACRO pPort, pData
+    ld          d, pPort
+    ld          a, pData
+    call        WriteOPN
+    ENDM
+
+SendOPNA MACRO pPort, pData
+    ld          d, pPort
+    ld          a, pData
+    call        WriteOPNA
+    ENDM
+
+WriteOPNReg:
+    ld          c, 44h
+;Waiting for BUSY
+.waitBusy:
+    in          b, (c)
+    jp          m, .waitBusy
+; Register specification
+    out         (c), d
+    ret
+    
+InitOPNPart:
+    push        bc
+    call        WriteOPN
+    inc         d
+    call        WriteOPN
+    inc         d
+    call        WriteOPN
+    inc         d
+    pop         bc
+    ret
+    
+InitOPNAPart:
+    push        bc
+    call        WriteOPNA
+    inc         d
+    call        WriteOPNA
+    inc         d
+    call        WriteOPNA
+    inc         d
+    pop         bc
+    ret
+    
+WriteOPN:
+    ld          c, 44h
+;Waiting for BUSY
+.waitBusy:
+    in          b, (c)
+    jp          m, .waitBusy
+; Register specification
+    out         (c), d
+;Write to data port
+    inc         c
+    out         (c), a
+    ret
+    
+WriteOPNA:
+    ld          c, 44h
+.waitBusy:
+    in          b, (c)
+    jp          m, .waitBusy
+; register specification
+    inc         c
+    inc         c
+    out         (c), d
+;write to data port
+    inc         c
+    out         (c), a
+    ret
+    
+    
+OPNA_Setup:
+    SendOPN     0x27,0x30 ; Stop Timer-B
+    SendOPN     0x29,0x82 ; FM4-6 and ADPCM enable
+    ld          d,0x2d
+    call        WriteOPNReg
+	SendOPN		0x7,%00111000 ; SSG init
+    ret

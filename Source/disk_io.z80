@@ -1,0 +1,182 @@
+
+
+; Execute API function
+Sub_ExecuteFunc:
+    push       af
+    ld         a,0xd
+    call       Sub_SendCmd
+    ld         a,hibyte(s_SubProgram)
+    call       Sub_SendData
+    xor        a
+    call       Sub_SendData
+    ld         a,c
+    call       Sub_SendData
+    pop        af
+    ret
+    
+Sub_SendCmd:
+    push       af
+    ld         a,0xf
+    out        (P_FF_DiskSysControl),a
+    pop        af
+Sub_SendData:
+    push       af
+.wait1:
+    in         a,(P_FE_DiskSysPortC)                        
+    and        0x02
+    jr         z,.wait1
+    ld         a,0xe
+    out        (P_FF_DiskSysControl),a
+    pop        af
+    out        (P_FD_DiskSysPortB),a     
+    ld         a,0x9
+    out        (P_FF_DiskSysControl),A
+.wait2:                              
+    in         a,(P_FE_DiskSysPortC)        
+    and        0x04
+    jr         z,.wait2
+    ld         a,0x8
+    out        (P_FF_DiskSysControl),a
+.wait3:                                 
+    in         a,(P_FE_DiskSysPortC)     
+    and        0x04
+    jr         nz,.wait3
+    ret
+	
+;
+;Data reception
+;
+;RESULT: A data
+;
+Sub_RecvData:
+;RFD = 1
+    ld         a,0bh
+    out        (0ffh), a
+;wait until dav = 1
+.wait1:
+    in         a,(0feh)
+    rrca
+    jr         nc, .wait1
+;rfd = 0
+    ld         a,0ah
+    out        (0ffh), a
+;data reception
+    in         a,(0fch)
+    push       af
+;dac = 1
+    ld         a,0dh
+    out        (0ffh), a
+;wait until dav = 0
+.wait2:
+    in         a,(0feh)
+    rrca
+    jr         c, .wait2
+;dac = 0
+    ld         a,0ch
+    out        (0ffh), a
+; end
+    pop        af
+    ret
+    
+;;
+;High-speed data transmission
+;;
+;PARAM .: HL buffer
+;PARAM .: BC repeat count (BC * 4 bytes sent)
+;;
+Disk_SendFast:
+;Set 8255 to 4-byte transmission mode (PA = transmit, PB = transmit)
+    ld          a, 81h
+    out (0ffh), a
+.send1:
+    ld a, (hl)
+    inc hl
+    out (0fch), a
+    ld a, (hl)
+    inc hl
+    out (0fdh), a
+;send dav = 1
+    ld a, 09h
+    out (0ffh), a
+;wait until dav = 1
+.send2:
+    in a, (0feh)
+    rrca
+    jr nc, .send2
+;send data 3
+    ld a, (hl)
+    inc hl
+    out (0fch), a
+;send data 4
+    ld a, (hl)
+    inc hl
+    out (0fdh), a
+;send dav = 0
+    ld a, 08h
+    out (0ffh), a
+;wait until dav = 0
+.send3:
+    in a, (0feh)
+    rrca
+    jr c, .send3
+; loop
+    dec bc
+    ld a, c
+    or b
+    jr nz, .send1
+;set 8255 to normal mode (pa = receive, pb = send)
+    ld a, 91h
+    out (0ffh), a
+    ret
+    
+; 
+;High-speed data reception
+;;
+;PARAM .: HL buffer
+;PARAM .: BC repeat count (BC * 4 bytes received)
+;;
+Disk_RecvFast:
+;Set 8255 to 4-byte receive mode (PA = receive, PB = receive)
+    ld a, 93h
+    out (0ffh), a
+;wait until dav = 1
+.recv1:
+    in a, (0feh)
+    rrca
+    jr nc, .recv1
+;receive data 1
+    in a, (0fdh)
+    ld (hl), a
+    inc hl
+;receive data 2
+    in a, (0fch)
+    ld (hl), a
+    inc hl
+;send dav = 1
+    ld a, 09h
+    out (0ffh), a
+;wait until dav = 0
+.recv2:
+    in a, (0feh)
+    rrca
+    jr c, .recv2
+;receive data 3
+    in a, (0fdh)
+    ld (hl), a
+    inc hl
+;receive data 4
+    in a, (0fch)
+    ld (hl), a
+    inc hl
+;send dav = 0
+    ld a, 08h
+    out (0ffh), a
+; loop
+    dec bc
+    ld a, c
+    or b
+    jr nz, .recv1
+;set 8255 to normal mode (pa = receive, pb = send)
+    ld a, 91h
+    out (0ffh), a
+    ret
